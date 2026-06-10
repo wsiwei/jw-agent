@@ -45,6 +45,14 @@ class Config:
     def upload_path(self) -> str:
         return self.server.get('upload_path', 'upload')
 
+    @property
+    def qdrant(self) -> dict:
+        return self._config.get('qdrant', {})
+
+    @property
+    def embedding(self) -> dict:
+        return self._config.get('embedding', {})
+
 
 # 全局配置实例
 config = Config()

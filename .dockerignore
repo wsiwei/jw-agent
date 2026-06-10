@@ -1,0 +1,33 @@
+# Python 缓存
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Git
+.git/
+.gitignore
+
+# 测试
+tests/
+
+# 开发工具
+chat_client.py
+chat.bat
+scripts/
+*.tar
+
+# 敏感配置（运行时挂载，不打进镜像）
+config/
+
+# 源数据（已导入达梦数据库，容器不需要）
+人员数据/
+
+# 本地上传文件
+upload/
+
+# IDE
+.vscode/
+.idea/

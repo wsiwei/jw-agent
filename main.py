@@ -1,20 +1,25 @@
 import logging
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 from pathlib import Path
+from typing import Optional
 
 from app.config import config
+from langgraph.errors import GraphInterrupt
 from app.models import (
     AgentGetRecordRequest, AgentGetRecordResponse,
     SpeechTTSRequest, SpeechTTSResponse,
     SpeechASRRequest, SpeechASRResponse,
-    WebSocketMessage, AiChatRecord
+    WebSocketMessage, WebSocketMessageData, WebSocketContentItem, AiChatRecord,
+    KnowledgeCategoryRequest, KnowledgeDocumentRequest,
+    KnowledgeWriteRequest, KnowledgeDeleteRequest,
 )
 from app.agent_service import AgentService
 from app.speech_service import SpeechService
-from app.utils import success_response, error_response, generate_chat_id, get_current_timestamp
+from app.knowledge_service import get_knowledge_service
+from app.utils import success_response, error_response, generate_chat_id, get_current_timestamp, generate_uuid
 from app.database import init_database
 
 # 配置日志
@@ -90,30 +95,43 @@ async def get_agent_record(request: AgentGetRecordRequest):
 @app.websocket(f"{config.base_path}/agent/chat")
 async def agent_chat(websocket: WebSocket, user_id: str = "", session_id: str = ""):
     """WebSocket对话接口"""
+    import asyncio
     from app.utils import generate_uuid
     client_id = generate_uuid()
 
     await manager.connect(websocket, client_id)
 
+    # 当前正在运行的 stream_chat task，用于支持中止
+    current_task: asyncio.Task = None
+
     try:
         while True:
-            # 接收消息
             data = await websocket.receive_json()
             message = WebSocketMessage(**data)
 
             logger.info(f"收到消息类型: {message.type}, SessionID: {session_id}")
 
             if message.type == "heartbeat":
-                # 心跳消息，不处理
                 continue
 
             elif message.type == "aiMessage":
-                # AI对话消息
                 if len(message.data.content) == 0:
                     continue
 
+                # abort 控制消息：取消当前正在运行的 task
+                if message.data.content[0].type == "abort":
+                    logger.info(f"[WebSocket] 收到 abort 消息，取消当前任务")
+                    if current_task and not current_task.done():
+                        current_task.cancel()
+                        agent_service.cleanup_session(session_id)
+                    continue
+
                 user_content = message.data.content[0].content
+                domain = (message.data.content[0].extend or {}).get("domain", "")
                 ai_model = message.data.aiModel or "glm-4"
+                record_id = message.data.content[0].record_id or ""
+                user_roles = message.data.userRole or []
+                logger.info(f"[请求] SessionID={session_id} UserID={user_id} Roles={user_roles} Domain={domain!r} Content={user_content[:50]!r}")
 
                 # 保存用户消息
                 user_record = AiChatRecord(
@@ -127,35 +145,48 @@ async def agent_chat(websocket: WebSocket, user_id: str = "", session_id: str = 
                 )
                 await agent_service.save_chat_record(user_record)
 
-                # 处理并流式返回
-                try:
-                    await agent_service.stream_chat(websocket, user_content, ai_model, session_id)
-                except Exception as e:
-                    logger.error(f"处理消息失败: {e}", exc_info=True)
-                    err_msg = WebSocketMessage(
-                        type="aiMessage",
-                        data=WebSocketMessageData(
-                            role="assistant",
-                            aiModel=ai_model,
-                            content=[WebSocketContentItem(type="text", content=f"处理失败：{e}")]
-                        ),
-                        done=True
-                    )
-                    await websocket.send_json(err_msg.dict())
+                # 以 Task 方式运行，支持中止
+                async def run_chat():
+                    try:
+                        await agent_service.stream_chat(websocket, user_content, ai_model, session_id, domain=domain, record_id=record_id, user_roles=user_roles)
+                    except GraphInterrupt:
+                        logger.info("[AgentService] 图执行已挂起（interrupt），等待用户回复")
+                    except asyncio.CancelledError:
+                        logger.info("[AgentService] 任务已被中止")
+                        agent_service.cleanup_session(session_id)
+                    except Exception as e:
+                        logger.error(f"处理消息失败: {e}", exc_info=True)
+                        try:
+                            err_msg = WebSocketMessage(
+                                type="aiMessage",
+                                data=WebSocketMessageData(
+                                    role="assistant",
+                                    aiModel=ai_model,
+                                    content=[WebSocketContentItem(type="text", content=f"处理失败：{e}")]
+                                ),
+                                done=True
+                            )
+                            await websocket.send_json(err_msg.dict())
+                        except Exception:
+                            pass
+
+                current_task = asyncio.create_task(run_chat())
 
             elif message.type == "tts":
-                # TTS消息
                 if len(message.data.content) == 0:
                     continue
-
                 text = message.data.content[0].content
                 await agent_service.stream_tts(websocket, text)
 
     except WebSocketDisconnect:
+        if current_task and not current_task.done():
+            current_task.cancel()
         manager.disconnect(client_id)
+
     except Exception as e:
         logger.error(f"WebSocket错误: {e}")
         manager.disconnect(client_id)
+
 
 
 # ==================== Speech 接口 ====================
@@ -195,45 +226,100 @@ async def speech_asr(request: SpeechASRRequest):
 # ==================== Knowledge 接口 ====================
 
 @app.post(f"{config.base_path}/knowledge/category")
-async def get_knowledge_category():
-    """获取知识库分类列表"""
-    return success_response([])
-
-
-@app.post(f"{config.base_path}/knowledge/category/create")
-async def create_knowledge_category():
-    """创建知识库分类"""
-    return success_response({})
-
-
-@app.post(f"{config.base_path}/knowledge/category/edit")
-async def edit_knowledge_category():
-    """编辑知识库分类"""
-    return success_response({})
-
-
-@app.post(f"{config.base_path}/knowledge/category/delete")
-async def delete_knowledge_category():
-    """删除知识库分类"""
-    return success_response({})
+async def get_knowledge_category(request: KnowledgeCategoryRequest):
+    """获取知识库分类列表（当前用 Qdrant collection 内的 category_id 聚合）"""
+    try:
+        ks = get_knowledge_service()
+        # 滚动查询所有 payload，聚合出不重复的 category_id
+        categories = set()
+        offset = None
+        while True:
+            result, offset = ks._client.scroll(
+                collection_name=ks._collection,
+                limit=1000,
+                offset=offset,
+                with_payload=["category_id", "source"],
+            )
+            for point in result:
+                cid = point.payload.get("category_id", "")
+                if cid:
+                    categories.add(cid)
+            if offset is None:
+                break
+        return success_response([{"category_id": c} for c in sorted(categories)])
+    except Exception as e:
+        logger.error(f"获取知识库分类失败: {e}")
+        return success_response([])
 
 
 @app.post(f"{config.base_path}/knowledge/document")
-async def get_knowledge_document():
-    """获取知识库文档列表"""
-    return success_response({"documents": []})
+async def get_knowledge_document(request: KnowledgeDocumentRequest):
+    """获取某分类下的文档列表"""
+    try:
+        ks = get_knowledge_service()
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        docs = {}
+        offset = None
+        while True:
+            result, offset = ks._client.scroll(
+                collection_name=ks._collection,
+                scroll_filter=Filter(must=[
+                    FieldCondition(key="category_id",
+                                   match=MatchValue(value=request.category_id))
+                ]) if request.category_id else None,
+                limit=1000,
+                offset=offset,
+                with_payload=["doc_id", "source", "create_time"],
+            )
+            for point in result:
+                doc_id = point.payload.get("doc_id", "")
+                if doc_id and doc_id not in docs:
+                    docs[doc_id] = {
+                        "doc_id": doc_id,
+                        "source": point.payload.get("source", ""),
+                        "create_time": point.payload.get("create_time", 0),
+                    }
+            if offset is None:
+                break
+        return success_response({"documents": list(docs.values())})
+    except Exception as e:
+        logger.error(f"获取文档列表失败: {e}")
+        return success_response({"documents": []})
 
 
 @app.post(f"{config.base_path}/knowledge/document/write")
-async def write_knowledge_document():
-    """写入知识库文档"""
-    return success_response({})
+async def write_knowledge_document(
+    file: UploadFile = File(...),
+    doc_id: str = Form(...),
+    category_id: str = Form(...),
+    chunk_size: int = Form(500),
+    overlap: int = Form(50),
+):
+    """上传文件并切分写入 Qdrant"""
+    try:
+        upload_dir = Path(config.upload_path) / "knowledge"
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        file_path = upload_dir / file.filename
+        file_path.write_bytes(await file.read())
+
+        ks = get_knowledge_service()
+        count = ks.ingest_file(str(file_path), doc_id, category_id, chunk_size, overlap)
+        return success_response({"doc_id": doc_id, "chunks": count})
+    except Exception as e:
+        logger.error(f"写入知识库失败: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content=error_response(500, str(e)))
 
 
 @app.post(f"{config.base_path}/knowledge/document/delete")
-async def delete_knowledge_document():
-    """删除知识库文档"""
-    return success_response({})
+async def delete_knowledge_document(request: KnowledgeDeleteRequest):
+    """删除文档的所有 chunk"""
+    try:
+        ks = get_knowledge_service()
+        ks.delete_document(request.doc_id)
+        return success_response({"doc_id": request.doc_id})
+    except Exception as e:
+        logger.error(f"删除文档失败: {e}")
+        return JSONResponse(status_code=500, content=error_response(500, str(e)))
 
 
 # ==================== 健康检查 ====================

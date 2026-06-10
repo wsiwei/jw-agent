@@ -38,6 +38,12 @@ class DMDatabase:
             )
             logger.info("✅ 达梦数据库连接成功")
             return self._connection
+        except SystemError as e:
+            # dmPython 会将底层 DatabaseError 包装成 SystemError，
+            # 通过 __cause__ 取出真实的错误信息
+            real = e.__cause__ if e.__cause__ is not None else e
+            logger.error(f"❌ 达梦数据库连接失败: {real}")
+            raise real from e
         except Exception as e:
             logger.error(f"❌ 达梦数据库连接失败: {e}")
             raise
@@ -56,6 +62,11 @@ class DMDatabase:
         try:
             yield cursor
             conn.commit()
+        except SystemError as e:
+            conn.rollback()
+            real = e.__cause__ if e.__cause__ is not None else e
+            logger.error(f"数据库操作失败: {real}")
+            raise real from e
         except Exception as e:
             conn.rollback()
             logger.error(f"数据库操作失败: {e}")
